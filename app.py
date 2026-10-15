@@ -225,6 +225,60 @@ async def services() -> Any:
     return {"services": mcp_server.SERVICE_CATALOG}
 
 
+# ----------------------------------------------------------------- tools API
+# A detached MCPServer instance used purely to execute tools on demand from the
+# dashboard, so users can verify a capability without going through the robot.
+_TOOL_SERVER = mcp_server.MCPServer()
+_TOOL_SERVER.set_services(list(mcp_server.SERVICE_CATALOG.keys()))
+
+
+@app.get("/api/tools")
+async def list_tools(request: Request) -> Any:
+    require_user(request)
+    return {
+        "tools": [
+            {
+                "name": t.name,
+                "description": t.description,
+                "service": t.service,
+                "schema": t.schema,
+            }
+            for t in mcp_server.ALL_TOOLS
+        ],
+        "services": mcp_server.SERVICE_CATALOG,
+    }
+
+
+@app.post("/api/tools/call")
+async def call_tool(request: Request) -> Any:
+    require_user(request)
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    args = body.get("arguments") or {}
+    if name not in _TOOL_SERVER.tools:
+        raise HTTPException(400, f"未知工具：{name}")
+    if not isinstance(args, dict):
+        raise HTTPException(400, "arguments 必须是对象")
+
+    raw = await _TOOL_SERVER.handle(
+        json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": name, "arguments": args}},
+            ensure_ascii=False,
+        )
+    )
+    obj = json.loads(raw or "{}")
+    res = obj.get("result") or {}
+    text = ""
+    if res.get("content"):
+        text = (res["content"][0] or {}).get("text", "")
+    return {
+        "ok": not res.get("isError", False),
+        "text": text,
+        "error": (obj.get("error") or {}).get("message", ""),
+    }
+
+
 # -------------------------------------------------------------- instance API
 def _persist() -> None:
     data = [
@@ -380,6 +434,7 @@ label{display:block;font-size:13px;font-weight:600;margin:14px 0 6px;color:#3741
   <div class="logo"><span class="dot"></span>小智 MCP 云</div>
   <a class="tab active" href="#" data-view="dash">仪表盘</a>
   <a class="tab" href="#" data-view="market">服务市场</a>
+  <a class="tab" href="#" data-view="tools">工具测试</a>
   <div class="spacer"></div>
   <div class="user" id="userbox"></div>
 </div></header>
@@ -390,7 +445,7 @@ label{display:block;font-size:13px;font-weight:600;margin:14px 0 6px;color:#3741
 <script>
 const $ = (s,d=document)=>d.querySelector(s);
 const esc = s => String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const state = {view:'dash', user:null, instances:[], services:{}, timer:null, logFor:null};
+const state = {view:'dash', user:null, instances:[], services:{}, tools:[], toolName:null, timer:null, logFor:null};
 
 async function api(path, opts={}){
   const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
@@ -436,7 +491,9 @@ function render(){
 
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active', t.dataset.view===state.view));
   if(!state.user){ $('#app').innerHTML=authView(window.__setup); bindAuth(window.__setup); return; }
-  $('#app').innerHTML = state.view==='dash' ? dashView() : marketView();
+  $('#app').innerHTML = state.view==='dash' ? dashView()
+                      : state.view==='market' ? marketView()
+                      : toolsView();
   bindView();
 }
 
@@ -516,6 +573,35 @@ function marketView(){
   <div class="grid">${items}</div>`;
 }
 
+function toolsView(){
+  const ts = state.tools||[];
+  if(!ts.length) return `<h1>工具测试</h1><div class="sub">正在加载工具列表…</div>`;
+  const cur = ts.find(t=>t.name===state.toolName) || ts[0];
+  const schema = cur.schema||{};
+  const props = schema.properties||{};
+  const req = new Set(schema.required||[]);
+  const fields = Object.entries(props).map(([k,v])=>`
+    <label>${esc(k)}${req.has(k)?' <span style="color:var(--err)">*</span>':''} <span style="font-weight:400;color:var(--muted)">${esc(v.type||'')}</span></label>
+    <input id="arg_${esc(k)}" placeholder="${esc(v.description||'')}">`).join('')
+    || '<div class="hint">该工具无需参数</div>';
+  return `
+  <h1>工具测试</h1>
+  <div class="sub">在云端直接调用工具，验证服务是否可用 —— 不需要通过小智语音</div>
+  <div class="card" style="margin-top:18px">
+    <label>选择工具</label>
+    <select id="toolsel">${ts.map(t=>`<option value="${esc(t.name)}" ${t.name===cur.name?'selected':''}>${esc(t.name)} · ${esc(t.description)}</option>`).join('')}</select>
+    <div class="meta" style="margin:10px 0 2px">所属服务：<span class="tag">${esc((state.services[cur.service]||{}).name||cur.service)}</span></div>
+    ${fields}
+    <div class="err" id="terr"></div>
+    <div class="row" style="margin-top:16px">
+      <button class="primary" id="trun">运行</button>
+      <button id="tclear">清空</button>
+    </div>
+    <pre id="tout" class="logs" style="display:none;margin-top:14px;max-height:340px;white-space:pre-wrap"></pre>
+  </div>
+  <div class="foot">工具与「服务市场」中安装的服务共用同一套实现</div>`;
+}
+
 function bindView(){
   document.querySelectorAll('[data-act]').forEach(b=>{
     b.onclick = async ()=>{
@@ -529,6 +615,34 @@ function bindView(){
   document.querySelectorAll('[data-install]').forEach(b=>{
     b.onclick = ()=> openInstall(b.dataset.install);
   });
+
+  const sel=$('#toolsel');
+  if(sel){
+    sel.onchange = ()=>{ state.toolName = sel.value; render(); };
+    const run=$('#trun');
+    if(run) run.onclick = async ()=>{
+      const cur=(state.tools||[]).find(t=>t.name===state.toolName)||state.tools[0];
+      const props=(cur.schema&&cur.schema.properties)||{};
+      const args={};
+      Object.keys(props).forEach(k=>{
+        const el=$('#arg_'+k); const v=el? el.value.trim() : '';
+        if(v==='') return;
+        const ty=(props[k]||{}).type;
+        if(ty==='number'||ty==='integer'){ const n=Number(v); args[k]= isNaN(n)? v : n; }
+        else if(ty==='boolean') args[k]= (v==='true');
+        else args[k]=v;
+      });
+      const err=$('#terr'), out=$('#tout');
+      err.style.display='none'; out.style.display='block'; out.textContent='运行中…';
+      try{
+        const d=await api('/api/tools/call',{method:'POST',body:JSON.stringify({name:cur.name,arguments:args})});
+        out.textContent = (d.ok? '[成功] ' : '[失败] ') + (d.text || d.error || '(空结果)');
+      }catch(e){ out.textContent='[错误] '+e.message; }
+      await refresh(); // tool_calls 计数立即刷新
+    };
+    const cl=$('#tclear');
+    if(cl) cl.onclick = ()=>{ const o=$('#tout'); o.textContent=''; o.style.display='none'; };
+  }
 }
 
 // -------------------------------------------------------------------- modal
@@ -573,8 +687,11 @@ document.querySelectorAll('.tab').forEach(t=> t.onclick = e=>{ e.preventDefault(
 
 async function refresh(){
   try{
-    const [i,s] = await Promise.all([api('/api/instances'), api('/api/services')]);
+    const reqs = [api('/api/instances'), api('/api/services')];
+    if(state.user) reqs.push(api('/api/tools'));
+    const [i,s,t] = await Promise.all(reqs);
     state.instances=i.instances||[]; state.services=s.services||{};
+    if(t && t.tools) state.tools=t.tools;
   }catch(e){}
 }
 async function boot(){
@@ -582,7 +699,8 @@ async function boot(){
   try{ const m = await api('/api/me'); state.user = m.email; }catch(e){}
   window.__setup = !!b.needs_setup;
   await refresh(); render();
-  setInterval(async ()=>{ if(state.user){ await refresh(); render(); } }, 5000);
+  // never auto-re-render the tools view: it would wipe the result box mid-read
+  setInterval(async ()=>{ if(state.user){ await refresh(); if(state.view!=='tools') render(); } }, 5000);
 }
 boot();
 </script>
