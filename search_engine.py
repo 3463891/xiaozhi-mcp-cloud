@@ -367,22 +367,62 @@ def _secid(code: str) -> str:
     return "0." + code
 
 
-async def get_stock_price(code: str) -> str:
-    """A-share / HK / US quote via public endpoints."""
-    raw = code.strip()
-    secid = _secid(raw)
-    async with _client() as c:
-        r = await c.get(
-            "https://push2.eastmoney.com/api/qt/stock/get",
-            params={
-                "secid": secid,
-                "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f169,f170,f168,f171",
-            },
-        )
-        r.raise_for_status()
-        d = (r.json() or {}).get("data") or {}
+def _prefix(code: str) -> str:
+    """sh600023 / sz000001 / bj430047 for Tencent + Sina endpoints."""
+    c = re.sub(r"^(sh|sz|bj)", "", code.strip().lower())
+    if c.startswith(("6", "9", "11", "5")):
+        return "sh" + c
+    if c.startswith(("4", "8")):
+        return "bj" + c
+    return "sz" + c
+
+
+def _f(x: Any) -> float | None:
+    try:
+        out = float(x)
+    except (TypeError, ValueError):
+        return None
+    return out
+
+
+def _px(x: Any) -> str:
+    return "—" if x is None else f"{x:.2f}"
+
+
+def _money(x: Any) -> str:
+    if x is None:
+        return "—"
+    if x >= 1e8:
+        return f"{x / 1e8:.2f} 亿元"
+    if x >= 1e4:
+        return f"{x / 1e4:.2f} 万元"
+    return f"{x:.0f} 元"
+
+
+def _fmt_quote(name, code, price, chg, pct, openp, high, low, prev, vol, amount) -> str:
+    arrow = "涨" if (chg or 0) > 0 else ("跌" if (chg or 0) < 0 else "平")
+    pct_s = "—" if pct is None else f"{pct:+.2f}"
+    vol_s = "—" if vol is None else f"{int(vol):,}"
+    return (
+        f"{name}({code}) {arrow}\n"
+        f"现价 {_px(price)} 元，涨跌 {_px(chg)} ({pct_s}%)\n"
+        f"今开 {_px(openp)}，最高 {_px(high)}，最低 {_px(low)}，昨收 {_px(prev)}\n"
+        f"成交量 {vol_s} 手，成交额 {_money(amount)}"
+    )
+
+
+async def _quote_eastmoney(c: httpx.AsyncClient, raw: str) -> str | None:
+    r = await c.get(
+        "https://push2.eastmoney.com/api/qt/stock/get",
+        params={
+            "secid": _secid(raw),
+            "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f169,f170",
+        },
+    )
+    r.raise_for_status()
+    d = (r.json() or {}).get("data") or {}
     if not d:
-        raise RuntimeError(f"未查到行情: {code}")
+        return None
 
     def v(k: str, div: int = 100) -> float | None:
         x = d.get(k)
@@ -390,22 +430,74 @@ async def get_stock_price(code: str) -> str:
             return None
         return x / div if div != 1 else x
 
-    name = d.get("f58") or raw
-    price = v("f43")
-    chg = v("f169")
     pct = v("f170", 1)
     if pct is not None:
         pct = pct / 100
-    high, low, openp, prev = v("f44"), v("f45"), v("f46"), v("f60")
-    vol = d.get("f47")
-    amount = d.get("f48")
-    arrow = "涨" if (chg or 0) > 0 else ("跌" if (chg or 0) < 0 else "平")
-    return (
-        f"{name}({d.get('f57') or raw}) {arrow}\n"
-        f"现价 {price} 元，涨跌 {chg} ({pct}%)\n"
-        f"今开 {openp}，最高 {high}，最低 {low}，昨收 {prev}\n"
-        f"成交量 {vol} 手，成交额 {amount} 元"
+    return _fmt_quote(
+        d.get("f58") or raw, d.get("f57") or raw,
+        v("f43"), v("f169"), pct, v("f46"), v("f44"), v("f45"), v("f60"),
+        d.get("f47"), d.get("f48"),
     )
+
+
+async def _quote_tencent(c: httpx.AsyncClient, raw: str) -> str | None:
+    r = await c.get(f"https://qt.gtimg.cn/q={_prefix(raw)}",
+                    headers={"Referer": "https://gu.qq.com/"})
+    r.raise_for_status()
+    m = re.search(r'="([^"]+)"', r.content.decode("gbk", "replace"))
+    if not m:
+        return None
+    f = m.group(1).split("~")
+    if len(f) < 38 or not f[1]:
+        return None
+    amount_wan = _f(f[37])
+    return _fmt_quote(
+        f[1], f[2] or raw,
+        _f(f[3]), _f(f[31]), _f(f[32]), _f(f[5]), _f(f[33]), _f(f[34]), _f(f[4]),
+        _f(f[36]), (amount_wan * 10000) if amount_wan is not None else None,
+    )
+
+
+async def _quote_sina(c: httpx.AsyncClient, raw: str) -> str | None:
+    sym = _prefix(raw)
+    r = await c.get(f"https://hq.sinajs.cn/list={sym}",
+                    headers={"Referer": "https://finance.sina.com.cn"})
+    r.raise_for_status()
+    m = re.search(r'="([^"]*)"', r.content.decode("gbk", "replace"))
+    if not m or not m.group(1).strip():
+        return None
+    f = m.group(1).split(",")
+    if len(f) < 32 or not f[0]:
+        return None
+    price, prev = _f(f[3]), _f(f[2])
+    chg = (price - prev) if (price is not None and prev is not None) else None
+    pct = (chg / prev * 100) if (chg is not None and prev) else None
+    vol_shares = _f(f[8])
+    return _fmt_quote(
+        f[0], sym[2:], price, chg, pct, _f(f[1]), _f(f[4]), _f(f[5]), prev,
+        (vol_shares / 100) if vol_shares is not None else None, _f(f[9]),
+    )
+
+
+async def get_stock_price(code: str) -> str:
+    """A-share quote with a 3-provider fallback chain (Eastmoney -> Tencent -> Sina).
+
+    A single provider can be geo-blocked or rate-limited, so never trust just one.
+    """
+    raw = code.strip()
+    errors: list[str] = []
+    async with _client() as c:
+        for name, fn in (("eastmoney", _quote_eastmoney),
+                         ("tencent", _quote_tencent),
+                         ("sina", _quote_sina)):
+            try:
+                out = await fn(c, raw)
+                if out:
+                    return out
+                errors.append(f"{name}:empty")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{name}:{type(e).__name__}")
+    raise RuntimeError(f"未查到行情 {code}（数据源均失败：{', '.join(errors)}）")
 
 
 # --------------------------------------------------------------------------
