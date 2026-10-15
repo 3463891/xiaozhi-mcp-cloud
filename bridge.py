@@ -179,13 +179,22 @@ class Instance:
 
     @staticmethod
     def _mask(uri: str) -> str:
+        """Show the endpoint with the token truncated, for logs and the API.
+
+        Rebuilt by hand rather than via urlencode() so the mask reads as
+        `?token=eyJh***` instead of `?token=eyJh%2A%2A%2A`.
+        """
         try:
-            from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
+            from urllib.parse import parse_qsl, urlsplit
 
             p = urlsplit(uri)
-            q = parse_qsl(p.query)
-            masked = [(k, (v[:4] + "***" if k.lower() == "token" and v else v)) for k, v in q]
-            return urlunsplit((p.scheme, p.netloc, p.path, urlencode(masked), p.fragment))
+            parts = []
+            for k, v in parse_qsl(p.query):
+                if k.lower() == "token" and v:
+                    v = v[:4] + "***"
+                parts.append(f"{k}={v}")
+            query = "&".join(parts)
+            return f"{p.scheme}://{p.netloc}{p.path}?{query}" if query else f"{p.scheme}://{p.netloc}{p.path}"
         except Exception:  # noqa: BLE001
             return uri
 

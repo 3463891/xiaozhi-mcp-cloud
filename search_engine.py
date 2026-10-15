@@ -15,6 +15,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -304,54 +305,158 @@ WMO = {
     85: "阵雪", 86: "强阵雪", 95: "雷阵雨", 96: "雷阵雨伴冰雹", 99: "强雷暴伴冰雹",
 }
 
+# wttr.in echoes English back in its lang_zh field, so translate ourselves.
+WTTR_ZH = {
+    "sunny": "晴", "clear": "晴",
+    "partly cloudy": "晴间多云", "cloudy": "多云", "overcast": "阴",
+    "mist": "薄雾", "fog": "雾", "freezing fog": "冻雾",
+    "haze": "霾", "smoky haze": "烟霾", "smoke": "烟",
+    "patchy rain nearby": "局部有雨", "patchy rain possible": "局部有雨",
+    "light drizzle": "小毛毛雨", "patchy light drizzle": "局部小毛毛雨",
+    "freezing drizzle": "冻毛毛雨", "light freezing rain": "小冻雨",
+    "heavy freezing rain": "大冻雨", "light rain": "小雨",
+    "moderate rain": "中雨", "heavy rain": "大雨",
+    "moderate rain at times": "间歇中雨", "heavy rain at times": "间歇大雨",
+    "light rain shower": "小阵雨", "moderate or heavy rain shower": "中到大阵雨",
+    "torrential rain shower": "暴雨", "thundery outbreaks possible": "可能有雷雨",
+    "thundery outbreaks in nearby": "附近有雷雨", "patchy light rain with thunder": "局部雷阵雨",
+    "moderate or heavy rain with thunder": "中到大雷雨",
+    "light snow": "小雪", "moderate snow": "中雪", "heavy snow": "大雪",
+    "patchy snow possible": "局部有雪", "blizzard": "暴风雪",
+    "light snow showers": "小阵雪", "moderate or heavy snow showers": "中到大阵雪",
+    "sleet": "雨夹雪", "light sleet": "小雨夹雪", "moderate or heavy sleet": "中到大雨夹雪",
+    "patchy sleet possible": "局部雨夹雪", "light freezing rain showers": "小冻雨",
+    "ice pellets": "冰粒",
+}
 
-async def get_weather(city: str) -> str:
-    async with _client() as c:
-        g = await c.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": city, "count": 1, "language": "zh", "format": "json"},
-        )
-        g.raise_for_status()
-        gd = g.json()
-        if not gd.get("results"):
-            raise RuntimeError(f"未找到城市: {city}")
-        loc = gd["results"][0]
-        lat, lon = loc["latitude"], loc["longitude"]
-        name = loc.get("name", city)
-        country = loc.get("country", "")
 
-        w = await c.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code",
-                "daily": "temperature_2m_max,temperature_2m_min,weather_code",
-                "timezone": "Asia/Shanghai",
-                "forecast_days": 3,
-            },
-        )
-        w.raise_for_status()
-        wd = w.json()
+def _zh_weather(desc: str) -> str:
+    """Map a wttr.in English description onto Chinese, with a few normalisations."""
+    d = (desc or "").strip().lower()
+    if not d:
+        return "未知"
+    if d in WTTR_ZH:
+        return WTTR_ZH[d]
+    for en, zh in WTTR_ZH.items():
+        if en in d:
+            return zh
+    return desc
 
+
+async def _weather_openmeteo(c: httpx.AsyncClient, city: str) -> str | None:
+    g = await c.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": city, "count": 1, "language": "zh", "format": "json"},
+    )
+    g.raise_for_status()
+    gd = g.json()
+    if not gd.get("results"):
+        return None
+    loc = gd["results"][0]
+
+    w = await c.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": loc["latitude"],
+            "longitude": loc["longitude"],
+            "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code",
+            "daily": "temperature_2m_max,temperature_2m_min,weather_code",
+            "timezone": "Asia/Shanghai",
+            "forecast_days": 3,
+        },
+    )
+    w.raise_for_status()
+    wd = w.json()
+
+    name = loc.get("name", city)
+    country = loc.get("country", "")
     cur = wd.get("current", {})
     daily = wd.get("daily", {})
-    code = cur.get("weather_code", 0)
     lines = [
-        f"{name}{(' / ' + country) if country else ''} 当前天气：{WMO.get(code, '未知')}",
+        f"{name}{(' / ' + country) if country else ''} 当前天气：{WMO.get(cur.get('weather_code', 0), '未知')}",
         f"气温 {cur.get('temperature_2m')}°C，湿度 {cur.get('relative_humidity_2m')}%，"
         f"风速 {cur.get('wind_speed_10m')} km/h",
     ]
     if daily.get("time"):
         lines.append("未来三天：")
         for i, d in enumerate(daily["time"]):
-            c2 = daily.get("weather_code", [0, 0, 0])[i]
+            code = (daily.get("weather_code") or [0])[i]
+            lo = (daily.get("temperature_2m_min") or ["?"])[i]
+            hi = (daily.get("temperature_2m_max") or ["?"])[i]
+            lines.append(f"  {d}: {WMO.get(code, '未知')} {lo}~{hi}°C")
+    return "\n".join(lines)
+
+
+async def _weather_wttr(c: httpx.AsyncClient, city: str) -> str | None:
+    """Fallback provider. wttr.in needs no key and is rarely rate-limited."""
+    r = await c.get(
+        f"https://wttr.in/{quote(city)}",
+        params={"format": "j1", "lang": "zh"},
+    )
+    r.raise_for_status()
+    try:
+        d = r.json()
+    except Exception:  # noqa: BLE001
+        return None
+    cc = (d.get("current_condition") or [{}])[0]
+    if not cc:
+        return None
+
+    def zh(obj: dict[str, Any]) -> str:
+        v = obj.get("weatherDesc")
+        if v and isinstance(v, list) and v[0].get("value"):
+            return _zh_weather(v[0]["value"])
+        return "未知"
+
+    area = (d.get("nearest_area") or [{}])[0]
+
+    def area_val(key: str) -> str:
+        v = area.get(key)
+        if v and isinstance(v, list) and v[0].get("value"):
+            return v[0]["value"]
+        return ""
+
+    # wttr.in returns romanised area names; the user's own input reads better
+    name = city or area_val("areaName")
+    country = area_val("country")
+    lines = [
+        f"{name}{(' / ' + country) if country else ''} 当前天气：{zh(cc)}",
+        f"气温 {cc.get('temp_C')}°C，湿度 {cc.get('humidity')}%，"
+        f"风速 {cc.get('windspeedKmph')} km/h",
+    ]
+    days = (d.get("weather") or [])[:3]
+    if days:
+        lines.append("未来三天：")
+        for day in days:
+            hourly = day.get("hourly") or [{}]
+            noon = hourly[4] if len(hourly) > 4 else hourly[0]
             lines.append(
-                f"  {d}: {WMO.get(c2, '未知')} "
-                f"{daily.get('temperature_2m_min', [0, 0, 0])[i]}~"
-                f"{daily.get('temperature_2m_max', [0, 0, 0])[i]}°C"
+                f"  {day.get('date')}: {zh(noon)} "
+                f"{day.get('mintempC')}~{day.get('maxtempC')}°C"
             )
     return "\n".join(lines)
+
+
+async def get_weather(city: str) -> str:
+    """Weather with a provider fallback chain (Open-Meteo -> wttr.in).
+
+    Open-Meteo rate-limits per source IP (429); shared cloud egress IPs hit that
+    fast, so a second independent provider is required for reliability.
+    """
+    city = (city or "").strip()
+    if not city:
+        raise RuntimeError("请提供城市名")
+    errors: list[str] = []
+    async with _client() as c:
+        for name, fn in (("open-meteo", _weather_openmeteo), ("wttr.in", _weather_wttr)):
+            try:
+                out = await fn(c, city)
+                if out:
+                    return out
+                errors.append(f"{name}:empty")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{name}:{type(e).__name__}")
+    raise RuntimeError(f"未查到天气: {city}（数据源均失败：{', '.join(errors)}）")
 
 
 # --------------------------------------------------------------------------
