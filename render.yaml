@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: xiaozhi-mcp-cloud
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore
+    healthCheckPath: /healthz
+    envVars:
+      - key: PORT
+        value: "7860"
+      - key: DATA_DIR
+        value: /data
+      - key: ALLOW_PUBLIC_REGISTER
+        value: "false"
+      # 强烈建议设置：部署后首次打开页面会引导创建管理员账号
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        generateValue: true
+      - key: SECRET_KEY
+        generateValue: true
+      # 可选：填了会在启动时自动连上一个小智 MCP 接入点（容器重启也不会丢）
+      - key: MCP_ENDPOINT
+        sync: false
+      - key: MCP_SERVICES
+        value: cloud-search,finance,life,utils
+      # 可选：搜索增强密钥，留空则用免密钥引擎
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: SELF_URL
+        value: https://xiaozhi-mcp-cloud.onrender.com
+      - key: KEEPALIVE_INTERVAL
+        value: "180"

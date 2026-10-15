@@ -1,90 +1,105 @@
-# 小智 MCP 自托管平台（facaiai 平替·永久免费版）
+# 小智 MCP 云平台（自建版）
 
-> 功能与 facaiai.cn 完全等价的 MCP 工具桥，部署在你自己手里——**没有有效期，没有账号依赖**。
-> 当前已挂载到你的小智智能体「小十三定制款」上，提供 3 个免费工具：
+一套可免费部署在云端的「小智 MCP 网关」，功能对标 <https://www.facaiai.cn/dashboard>：
 
-| 工具 | 说明 | 数据源（全部免 API key） |
+- 网页控制台：注册 / 登录 / 服务市场 / 实例管理 / 实时日志
+- 后台常驻进程：主动 WebSocket 外连你的小智智能体 MCP 接入点，注册工具
+- 断线自动指数退避重连，7×24 在线
+- 内置工具：**云搜索**、网页抓取、股票行情、天气、时间、计算器
+
+## 原理
+
+小智官方控制台会为每个智能体生成一个 MCP 接入点：
+
+```
+wss://api.xiaozhi.me/mcp/?token=xxxxxxxx
+```
+
+这个接入点需要**工具提供方主动连上去**（官方示例 `mcp_pipe.py` 就是这么做的）。
+本项目把「桥接器 + MCP Server + Web 控制台」合成一个进程，部署到云上即可一直在线。
+
+```
+小智云端 (wss://api.xiaozhi.me)  <──WebSocket──  本服务  ──>  搜索引擎 / 行情 / 天气
+```
+
+## 内置服务
+
+| 服务 | 工具 | 说明 |
 |---|---|---|
-| `cloud_search` | 联网搜索（标题/摘要/链接） | DuckDuckGo → 百度 → Bing → SearXNG 四源容灾 |
-| `get_stock_quote` | A股/港股/美股实时行情（含 PE/PB/市值/换手） | 腾讯行情接口 |
-| `get_exchange_rate` | 货币汇率 | Frankfurter API |
+| 云搜索 | `web_search` `web_fetch` | 实时联网搜索 + 网页正文抓取 |
+| 股票行情 | `get_stock_price` | A 股实时价、涨跌幅、成交量 |
+| 生活助手 | `get_weather` `get_current_time` | 天气与三天预报、当前北京时间 |
+| 计算工具 | `calculator` | 数学表达式求值 |
 
-对小智说这些话即可触发：
-- "帮我搜一下今天的 AI 新闻" → 云搜索
-- "查一下浙能电力的股价" → 股票行情
-- "现在美元兑人民币多少" → 汇率
+搜索后端按优先级自动回退：**Tavily**（若配置了 Key）→ Bing → DuckDuckGo → 搜狗 → SearXNG。
+免密钥即可开箱使用。
 
-## 架构原理
+## 一、获取小智 MCP 接入点
 
-```
-小智设备 ──> xiaozhi.me 智能体（小十三定制款）
-                 │  MCP 接入点 wss://api.xiaozhi.me/mcp/?token=...（你的 token，有效期至 2027-10-07）
-                 ▼
-       本机常驻 bridge（xiaozhi_mcp_bridge.py，开机自启）
-                 │  主动出站 WebSocket，无需公网 IP
-                 ▼
-       DuckDuckGo / 百度 / 腾讯行情 / Frankfurter
-```
+1. 打开 <https://xiaozhi.me/console/login> 登录
+2. 右上角创建 / 选择你的智能体
+3. 点击【配置】→【扩展能力】→【MCP 接入点】→ 复制地址（形如 `wss://api.xiaozhi.me/mcp/?token=...`）
 
-小智云端是 MCP 客户端，bridge 主动连上接入点后，云端会下发 `initialize → tools/list`，
-对话中 LLM 决定调用工具时下发 `tools/call`，bridge 执行并返回结果——与 facaiai 实例的工作方式完全一致。
+## 二、部署（三种免费方式，任选其一）
 
-## 当前部署状态（2026-10-15 已上线运行）
+### 方式 A：Render（免费，无需信用卡）
 
-- **进程**：Windows 计划任务 `XiaoZhi-MCP-Bridge`，登录自启，pythonw 无窗口后台运行
-- **配置**：接入点在 `config.json`（从你 facaiai 实例绑定的地址直接复用，token 到 2027-10-07）
-- **日志**：`bridge.log`（滚动，2MB × 2 份）
-- **依赖**：venv `~/.workbuddy/binaries/python/envs/default`（websockets/httpx/bs4）
+1. 把本仓库 push 到你的 GitHub
+2. 打开 <https://dashboard.render.com/blueprints>，用 GitHub 登录
+3. 选择本仓库，Render 会自动读取 `render.yaml` 并构建
+4. 部署完成后得到 `https://xxx.onrender.com`
 
-### 日常管理命令（管理员 PowerShell）
+> 免费档 15 分钟无访问会休眠。本项目内置自 ping 保活：把 `SELF_URL` 改成你的实际地址即可永不休眠。
 
-```powershell
-# 看运行状态
-Get-ScheduledTask -TaskName "XiaoZhi-MCP-Bridge"
-# 看实时日志
-Get-Content "$HOME\WorkBuddy\2026-10-15-10-11-20\xiaozhi-mcp-cloud\bridge.log" -Tail 30 -Encoding UTF8 -Wait
-# 重启服务
-Stop-ScheduledTask -TaskName "XiaoZhi-MCP-Bridge"; Start-ScheduledTask -TaskName "XiaoZhi-MCP-Bridge"
-```
+### 方式 B：ClawCloud Run（免费、常驻不休眠、新加坡/日本节点）
 
-### 修改/新增工具
+1. 打开 <https://console.run.claw.cloud/signin>，用 GitHub 登录
+2. 进入 App Launchpad → Create App
+3. 镜像源填 `ghcr.io/<你的用户名>/xiaozhi-mcp-cloud:main`（仓库已配置 GitHub Actions 自动构建）
+4. 端口填 `7860`，开启公网访问 → 得到 HTTPS 域名
 
-编辑 `xiaozhi_mcp_bridge.py`：
-1. 写一个 `async def tool_xxx(args: dict) -> dict` 函数，返回 `ok(结果)` / `err(原因)`
-2. 在 `TOOL_DESCRIPTIONS` 里加描述（name/description/inputSchema）
-3. 在 `TOOL_HANDLERS` 里注册
-4. 重启服务即可
+### 方式 C：任意支持 Docker 的平台
 
-## 迁移到云端（可选，"网上部署"形态）
-
-**前置条件**：能访问 huggingface.co 的网络（开 VPN）+ 一个 HF 账号 token。
-
-```powershell
-pip install huggingface_hub   # 装进 venv
-python deploy_hf.py --hf-token hf_xxxx
+```bash
+docker build -t xiaozhi-mcp-cloud .
+docker run -d -p 7860:7860 \
+  -e ADMIN_EMAIL=admin@example.com \
+  -e ADMIN_PASSWORD=change-me \
+  xiaozhi-mcp-cloud
 ```
 
-一键完成后在 HF Spaces 运行（永久免费 Docker 容器）。云端上线后停本地：
+## 三、使用
 
-```powershell
-schtasks /Change /TN "XiaoZhi-MCP-Bridge" /DISABLE
-```
+1. 浏览器打开部署好的地址，注册管理员账号并登录
+2. 「服务市场」→ 选择「云搜索」→【安装并绑定】
+3. 粘贴第一步复制的小智 MCP 接入点 → 安装
+4. 实例状态变为「运行中」后，回到 xiaozhi.me 控制台刷新，即可看到工具已接入
+5. 对小智说话测试：「帮我搜一下今天的科技新闻」
 
-注意：**同一接入点建议只保留一个客户端在线**，本地/云端二选一，避免行为不可预期的互踢。
+## 环境变量
 
-## facaiai 说明
-
-- 你的 facaiai 账户有效期到 **2027/1/13**，实例"联网搜索"(ID:1229) 可以在它后台停掉（不再需要）
-- 它在你智能体上挂的旧工具与本服务无冲突；停掉 facaiai 实例后，本服务是唯一工具来源
-- 接入点 token 本身是小智的（facaiai 只是借用绑定），token 有效期到 **2027-10-07**，在 xiaozhi.me 控制台可重置/续期
-
-## 文件清单
-
-| 文件 | 用途 |
+| 变量 | 说明 |
 |---|---|
-| `xiaozhi_mcp_bridge.py` | 主服务（单文件，本地/云端通用） |
-| `config.json` | 接入点配置（敏感，勿外传） |
-| `test_server.py` | 协议集成自测（模拟小智云端，5 项断言） |
-| `Dockerfile` / `README_HF.md` / `deploy_hf.py` | 云端部署包 |
-| `cdp_probe.py` / `facaiai_probe.py` | 取接入点用的 CDP 探针（一次性工具） |
-| `bridge.log` | 运行日志 |
+| `PORT` | 监听端口，默认 7860 |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | 管理员账号，设置后重启不丢 |
+| `SECRET_KEY` | 会话签名密钥，建议设置 |
+| `ALLOW_PUBLIC_REGISTER` | 是否开放自助注册，默认 true，公网建议 false |
+| `MCP_ENDPOINT` | 可选，启动时自动创建并连接的默认实例 |
+| `MCP_SERVICES` | 默认实例启用的服务，逗号分隔 |
+| `TAVILY_API_KEY` / `BOCHA_API_KEY` | 可选，搜索质量增强 |
+| `SELF_URL` | 自身公网地址，用于防休眠保活 |
+| `KEEPALIVE_INTERVAL` | 保活间隔秒数，默认 180 |
+
+## 本地运行
+
+```bash
+pip install -r requirements.txt
+python app.py
+# http://127.0.0.1:7860
+```
+
+本地端到端测试（模拟小智云端跑完整 MCP 握手）：
+
+```bash
+python test_e2e.py
+```
