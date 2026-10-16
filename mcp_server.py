@@ -87,6 +87,7 @@ class MCPServer:
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
+            logger.warning("unparseable inbound frame: %.200s", raw)
             return self._err(None, -32700, "Parse error")
 
         if isinstance(msg, list):
@@ -115,6 +116,8 @@ class MCPServer:
             return await self._call_tool(mid, params)
         if method == "resources/list":
             return self._ok(mid, {"resources": []})
+        if method == "resources/templates/list":
+            return self._ok(mid, {"resourceTemplates": []})
         if method == "prompts/list":
             return self._ok(mid, {"prompts": []})
         if method == "logging/setLevel":
@@ -124,7 +127,11 @@ class MCPServer:
         if mid is None:
             logger.debug("ignoring notification: %s", method)
             return None
-        return self._err(mid, -32601, f"Method not found: {method}")
+        # MCP clients may treat a -32601 error frame as a hard failure
+        # (XiaoZhi devices buzz/show ERROR). An empty success keeps the
+        # session quiet while we still log the unsupported method loudly.
+        logger.warning("unsupported method %s (id=%s), replying empty ok", method, mid)
+        return self._ok(mid, {})
 
     async def _initialize(self, mid: Any, params: dict[str, Any]) -> str:
         client_version = (params or {}).get("protocolVersion") or PROTOCOL_VERSION
