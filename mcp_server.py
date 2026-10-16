@@ -66,11 +66,17 @@ class MCPServer:
                 self.register(t)
 
     def set_services(self, services: list[str]) -> None:
-        """Rebuild the tool registry so only the given services are exposed."""
+        """Rebuild the tool registry so only the given services are exposed.
+
+        Register fresh Tool copies rather than sharing the module-level
+        ALL_TOOLS objects. bridge.py wraps handlers in place to count calls;
+        with shared objects, every reconnect would add one more wrapper layer
+        (duplicated '调用工具' log lines and inflated tool_calls counters).
+        """
         self.tools = {}
         for t in ALL_TOOLS:
             if t.service in services:
-                self.register(t)
+                self.register(Tool(t.name, t.description, t.schema, t.handler, t.service))
 
     # ---------------------------------------------------------------- dispatch
     async def handle(self, raw: str) -> str | None:

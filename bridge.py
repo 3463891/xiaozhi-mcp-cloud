@@ -172,8 +172,12 @@ class Instance:
                     line = line.strip()
                     if not line:
                         continue
+                    if os.environ.get("MCP_DEBUG_FRAMES", "1") == "1":
+                        logger.info("MCP <= %s", line[:600])
                     reply = await server.handle(line)
                     if reply:
+                        if os.environ.get("MCP_DEBUG_FRAMES", "1") == "1":
+                            logger.info("MCP => %s", reply[:600])
                         await ws.send(reply)
         self.status = "connecting"
 
