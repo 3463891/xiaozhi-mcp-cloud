@@ -49,10 +49,10 @@ async def fake_cloud(ready: asyncio.Event, got: list) -> None:
             line = await asyncio.wait_for(ws.recv(), timeout=15)
             got.append(("tools/call:calculator", json.loads(line)))
 
-            # 6) tools/call get_current_time
+            # 6) tools/call beijing_time
             await ws.send(json.dumps({
                 "jsonrpc": "2.0", "id": 5, "method": "tools/call",
-                "params": {"name": "get_current_time", "arguments": {}},
+                "params": {"name": "beijing_time", "arguments": {}},
             }))
             line = await asyncio.wait_for(ws.recv(), timeout=15)
             got.append(("tools/call:time", json.loads(line)))

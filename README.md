@@ -29,7 +29,7 @@ wss://api.xiaozhi.me/mcp/?token=xxxxxxxx
 |---|---|---|
 | 云搜索 | `web_search` `web_fetch` | 实时联网搜索 + 网页正文抓取 |
 | 股票行情 | `get_stock_price` | A 股实时价、涨跌幅、成交量 |
-| 生活助手 | `get_weather` `get_current_time` | 天气与三天预报、当前北京时间 |
+| 生活助手 | `weather_forecast` `beijing_time` | 天气与三天预报、当前北京时间 |
 | 计算工具 | `calculator` | 数学表达式求值 |
 
 搜索后端按优先级自动回退：**Tavily**（若配置了 Key）→ Bing → DuckDuckGo → 搜狗 → SearXNG。

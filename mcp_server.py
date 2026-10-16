@@ -23,6 +23,16 @@ SUPPORTED_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 TOOL_TIMEOUT = float(__import__("os").environ.get("TOOL_TIMEOUT", "25"))
 
 
+# 小智服务端内置函数名 —— MCP 工具撞名会让机器人「每轮对话先报错一次、之后又正常」
+# （get_weather 是 ToolType.SYSTEM_CTL，每轮自动取本地天气写上下文）
+XIAOZHI_BUILTIN_TOOL_NAMES = frozenset({"get_weather", "get_time", "get_current_time"})
+XIAOZHI_RISKY_TOOL_NAMES = frozenset({
+    "get_lunar", "change_role", "play_music", "handle_speaker", "call_device",
+    "handle_exit_intent", "get_news_from_chinanews", "get_news_from_newsnow",
+    "search_from_ragflow", "hass_state", "hass_init", "hass_play_music",
+})
+
+
 class Tool:
     def __init__(
         self,
@@ -58,6 +68,13 @@ class MCPServer:
 
     # ---------------------------------------------------------------- registry
     def register(self, tool: Tool) -> None:
+        if tool.name in XIAOZHI_BUILTIN_TOOL_NAMES:
+            logger.error(
+                "工具名 %r 与小智服务端内置函数重名，机器人将每轮对话先报错！请改名",
+                tool.name,
+            )
+        elif tool.name in XIAOZHI_RISKY_TOOL_NAMES:
+            logger.warning("工具名 %r 在小智生态里也是内置函数名（仅提示）", tool.name)
         self.tools[tool.name] = tool
 
     def register_service(self, service: str, tools: list[Tool]) -> None:
@@ -330,7 +347,7 @@ ALL_TOOLS: list[Tool] = [
         service="cloud-search",
     ),
     Tool(
-        name="get_weather",
+        name="weather_forecast",
         description="查询指定城市当前的天气情况以及未来三天的天气预报。",
         schema={
             "type": "object",
@@ -368,7 +385,7 @@ ALL_TOOLS: list[Tool] = [
         service="utils",
     ),
     Tool(
-        name="get_current_time",
+        name="beijing_time",
         description="获取当前北京时间和星期几。当用户问现在几点、今天几号时使用。",
         schema={"type": "object", "properties": {}},
         handler=_t_time,
@@ -399,7 +416,7 @@ SERVICE_CATALOG: dict[str, dict[str, Any]] = {
         "icon": "🌤️",
         "tagline": "天气查询 + 当前时间",
         "desc": "查询城市当前天气与三天预报，以及当前北京时间。",
-        "tools": ["get_weather", "get_current_time"],
+        "tools": ["weather_forecast", "beijing_time"],
         "free": True,
     },
     "utils": {
