@@ -173,15 +173,30 @@ class MCPServer:
             return self._ok(mid, {"content": [{"type": "text", "text": text}], "isError": False})
         except asyncio.TimeoutError:
             logger.error("tool %s timed out", name)
+            # Soft failure: XiaoZhi devices buzz + show ERROR on isError results,
+            # so report the problem as normal text the LLM can act on instead.
             return self._ok(
                 mid,
-                {"content": [{"type": "text", "text": f"工具 {name} 执行超时"}], "isError": True},
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"工具 {name} 执行超时，请稍后再试，或换个方式回答这个问题。",
+                        }
+                    ],
+                    "isError": False,
+                },
             )
         except Exception as e:  # noqa: BLE001
             logger.exception("tool %s failed", name)
             return self._ok(
                 mid,
-                {"content": [{"type": "text", "text": f"工具 {name} 执行失败: {e}"}], "isError": True},
+                {
+                    "content": [
+                        {"type": "text", "text": f"工具 {name} 执行失败: {e}。请换个方式回答用户的问题。"}
+                    ],
+                    "isError": False,
+                },
             )
 
     # ---------------------------------------------------------------- helpers
@@ -234,7 +249,15 @@ async def _t_web_fetch(args: dict[str, Any]) -> str:
         url = "https://" + url
     max_chars = int(args.get("max_chars") or 4000)
     max_chars = max(200, min(max_chars, 20000))
-    text = await se.fetch_url(url, max_chars)
+    try:
+        text = await se.fetch_url(url, max_chars)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("web_fetch %s failed: %s", url, e)
+        reason = str(e).strip() or type(e).__name__
+        return (
+            f"网页 {url} 抓取失败（{reason}）。这个站点可能禁止程序访问（常见于百度百科、"
+            f"知乎、微信公众号）。请改用 web_search 搜索相关关键词，或换一个网址再试。"
+        )
     return f"网页 {url} 的主要内容：\n{text}" if text else f"未能从 {url} 提取到内容。"
 
 

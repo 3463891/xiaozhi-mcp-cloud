@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -18,6 +19,9 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+
+logger = logging.getLogger("search")
+
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -273,16 +277,11 @@ async def web_search(query: str, count: int = 5) -> list[SearchResult]:
 # --------------------------------------------------------------------------
 # Page fetching
 # --------------------------------------------------------------------------
-async def fetch_url(url: str, max_chars: int = 4000) -> str:
-    async with _client() as c:
-        r = await c.get(url)
-        r.raise_for_status()
-        ctype = r.headers.get("content-type", "")
-        body = r.text
-
+async def _render(url: str, ctype: str, body: str, max_chars: int) -> str:
+    """Turn raw HTML/JSON into plain text."""
     if "json" in ctype:
         try:
-            return json.dumps(r.json(), ensure_ascii=False)[:max_chars]
+            return json.dumps(json.loads(body), ensure_ascii=False)[:max_chars]
         except Exception:  # noqa: BLE001
             pass
 
@@ -292,6 +291,38 @@ async def fetch_url(url: str, max_chars: int = 4000) -> str:
         body = m.group(1)
     text = _clean(body)
     return text[:max_chars]
+
+
+async def _fetch_jina(url: str, max_chars: int) -> str:
+    """Text-extraction proxy fallback for sites that block us (403/429/503)."""
+    async with _client(timeout=max(DEFAULT_TIMEOUT, 12)) as c:
+        r = await c.get(f"https://r.jina.ai/{url}")
+        r.raise_for_status()
+        text = _clean(r.text) if "<" in r.text[:200] else r.text.strip()
+    return text[:max_chars] if text else ""
+
+
+async def fetch_url(url: str, max_chars: int = 4000) -> str:
+    """Fetch a page; fall back to a reader proxy when the site blocks us."""
+    try:
+        async with _client() as c:
+            r = await c.get(url)
+            r.raise_for_status()
+            ctype = r.headers.get("content-type", "")
+            body = r.text
+        return await _render(url, ctype, body, max_chars)
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code if e.response is not None else 0
+        if code not in (401, 403, 405, 429, 503):
+            raise
+        logger.info("fetch_url %s blocked (%s), trying reader proxy", url, code)
+        try:
+            text = await _fetch_jina(url, max_chars)
+        except Exception as je:  # noqa: BLE001
+            raise RuntimeError(f"{code}（站点拒绝访问，备用通道也失败：{type(je).__name__}）") from e
+        if not text:
+            raise RuntimeError(f"{code}（站点拒绝访问，备用通道无内容）")
+        return text
 
 
 # --------------------------------------------------------------------------
@@ -584,12 +615,74 @@ async def _quote_sina(c: httpx.AsyncClient, raw: str) -> str | None:
     )
 
 
+async def _quote_us_sina(c: httpx.AsyncClient, ticker: str) -> str | None:
+    """US ticker (AAPL / GB_AAPL / US.AAPL) via Sina's gb_ endpoint."""
+    t = ticker.strip().lower()
+    for p in ("gb_", "us.", "us"):
+        if t.startswith(p):
+            t = t[len(p):]
+            break
+    t = re.sub(r"[^a-z0-9.\-]", "", t)
+    if not t:
+        return None
+    r = await c.get(f"https://hq.sinajs.cn/list=gb_{t}",
+                    headers={"Referer": "https://finance.sina.com.cn"})
+    r.raise_for_status()
+    m = re.search(r'="([^"]*)"', r.content.decode("gbk", "replace"))
+    if not m or not m.group(1).strip():
+        return None
+    f = m.group(1).split(",")
+    if len(f) < 22:
+        return None
+    name = f[0].strip() or t.upper()
+    price = _f(f[1])
+    prev = _f(f[21]) or _f(f[26])  # 昨收
+    openp, high, low = _f(f[5]), _f(f[6]), _f(f[7])
+    for k in (openp, high, low):  # pre-market reports 0.00 placeholders
+        if k == 0:
+            openp = openp if openp else None
+            high = high if high else None
+            low = low if low else None
+    vol = _f(f[11]) or _f(f[10])
+    chg = None if (price is None or prev is None) else price - prev
+    pct = None if (chg is None or not prev) else chg / prev * 100
+    arrow = "涨" if (chg or 0) > 0 else ("跌" if (chg or 0) < 0 else "平")
+
+    def px(v: float | None) -> str:
+        return "—" if v is None else f"{v:.2f}"
+
+    return (
+        f"{name}({t.upper()}) {arrow}\n"
+        f"现价 {px(price)} 美元，涨跌 {px(chg)} ({'—' if pct is None else f'{pct:+.2f}'}%)\n"
+        f"今开 {px(openp)}，最高 {px(high)}，最低 {px(low)}，昨收 {px(prev)}\n"
+        f"成交量 {'—' if vol is None else f'{int(vol):,}'} 股（数据：新浪财经）"
+    )
+
+
+def _is_us(code: str) -> bool:
+    """US tickers are alphabetic (AAPL) or carry a us./gb_ prefix."""
+    s = code.strip().lower()
+    if s.startswith(("gb_", "us.", "hk")):
+        return s.startswith(("gb_", "us."))
+    return bool(re.fullmatch(r"[a-z][a-z0-9.\-]{0,9}", s))
+
+
 async def get_stock_price(code: str) -> str:
     """A-share quote with a 3-provider fallback chain (Eastmoney -> Tencent -> Sina).
 
     A single provider can be geo-blocked or rate-limited, so never trust just one.
     """
     raw = code.strip()
+    if _is_us(raw):
+        async with _client() as c:
+            try:
+                out = await _quote_us_sina(c, raw)
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"美股 {raw} 行情获取失败：{type(e).__name__}") from e
+            if out:
+                return out
+            raise RuntimeError(f"未查到美股行情 {raw}（请确认代码，如 AAPL、NVDA）")
+
     errors: list[str] = []
     async with _client() as c:
         for name, fn in (("eastmoney", _quote_eastmoney),
